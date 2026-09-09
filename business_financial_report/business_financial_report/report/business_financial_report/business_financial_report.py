@@ -28,6 +28,8 @@ DEFAULT_CUSTOMERS = [
 	"GREAT MOUNTAIN GENERAL CONTRACTING CO.",
 	"مؤسسة جنى الجبيل للمقاولات",
 	"LEGACY CRANES COMPANY",
+	"Derra Jeddah Trading",
+	"AXON Power Company for General Contracting",
 ]
 
 DEFAULT_OTHER_ACCOUNTS = [
@@ -1118,11 +1120,12 @@ def render_html(filters, currency, summary, pos_summary, cash_bank_used,
 	<style>
 		.bfr-wrap * {{ box-sizing: border-box; }}
 		.bfr-wrap {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 8px; }}
-		.kpi-row {{ display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 20px; }}
-		.kpi-card {{ flex: 1 1 160px; border-radius: 10px; padding: 16px 14px; background: #fff;
-			box-shadow: 0 1px 6px rgba(0,0,0,.08); border-left: 4px solid #ccc; min-width: 150px; }}
+		.kpi-row {{ font-size: 0; margin: 0 -6px 20px -6px; }}
+		.kpi-card {{ display: inline-block; vertical-align: top; width: 230px; margin: 6px;
+			border-radius: 10px; padding: 14px 12px; background: #fff;
+			box-shadow: 0 1px 6px rgba(0,0,0,.08); border-left: 4px solid #ccc; }}
 		.kpi-card h5 {{ margin: 0 0 6px; font-size: 11px; color: #6c757d; text-transform: uppercase; letter-spacing: .5px; }}
-		.kpi-card h2 {{ margin: 0; font-size: 22px; font-weight: 700; }}
+		.kpi-card h2 {{ margin: 0; font-size: 20px; font-weight: 700; }}
 		.bfr-table {{ width: 100%; border-collapse: collapse; font-size: 12px; background:#fff;
 			border-radius:10px; overflow:hidden; box-shadow:0 1px 6px rgba(0,0,0,.08); }}
 		.bfr-table th {{ background: #343a40; color: #fff; padding: 9px 10px; font-size: 11px; text-align:left; white-space:nowrap; }}
