@@ -345,7 +345,7 @@ def get_pos_summary(filters):
 # =======================================================================
 
 def get_cash_bank_accounts_used(filters):
-	"""Cash & Bank accounts that saw ANY activity in the period, fully
+	"""Every Cash / Bank account of the company (even zero activity), fully
 	GL-reconciled per account:
 
 	Opening  = balance strictly before From Date
@@ -354,42 +354,52 @@ def get_cash_bank_accounts_used(filters):
 	JV Debit / JV Credit = journal entry legs during the period
 	Other    = net movement from every remaining voucher type
 	Closing  = Opening + Invoice + Payments + JV Debit - JV Credit + Other
-	           (= GL balance of the account at To Date)
-
-	So the Closing figure of every row matches ERPNext General Ledger /
-	Trial Balance for the same company & period exactly.
+	           (= GL balance of the account at To Date - matches GL/Trial Balance)
 	"""
 	p = base_params(filters)
 	gl_cond = get_conditions(filters, "gle")
 
 	rows = frappe.db.sql(f"""
 		SELECT acc.name AS account, acc.account_type AS account_type,
-			SUM(CASE WHEN gle.posting_date < %(from_date)s THEN gle.debit - gle.credit ELSE 0 END) AS opening,
-			SUM(CASE WHEN gle.posting_date BETWEEN %(from_date)s AND %(to_date)s
-						AND gle.voucher_type IN ('Sales Invoice', 'POS Invoice') THEN gle.debit - gle.credit ELSE 0 END) AS invoice_amount,
-			SUM(CASE WHEN gle.posting_date BETWEEN %(from_date)s AND %(to_date)s
-						AND gle.voucher_type = 'Payment Entry' THEN gle.debit - gle.credit ELSE 0 END) AS payment_amount,
-			SUM(CASE WHEN gle.posting_date BETWEEN %(from_date)s AND %(to_date)s
-						AND gle.voucher_type = 'Journal Entry' THEN gle.debit ELSE 0 END) AS jv_debit,
-			SUM(CASE WHEN gle.posting_date BETWEEN %(from_date)s AND %(to_date)s
-						AND gle.voucher_type = 'Journal Entry' THEN gle.credit ELSE 0 END) AS jv_credit,
-			SUM(CASE WHEN gle.posting_date BETWEEN %(from_date)s AND %(to_date)s
-						AND gle.voucher_type NOT IN ('Sales Invoice', 'POS Invoice', 'Payment Entry', 'Journal Entry')
-						THEN gle.debit - gle.credit ELSE 0 END) AS other_amount,
-			SUM(CASE WHEN gle.posting_date BETWEEN %(from_date)s AND %(to_date)s THEN gle.debit - gle.credit ELSE 0 END) AS period_movement,
-			COUNT(DISTINCT gle.voucher_no) AS txn_count
-		FROM `tabGL Entry` gle
-		INNER JOIN `tabAccount` acc ON acc.name = gle.account
-		WHERE gle.is_cancelled = 0 AND acc.account_type IN ('Cash', 'Bank')
-			{gl_cond}
+			COALESCE(g.opening, 0) AS opening,
+			COALESCE(g.invoice_amount, 0) AS invoice_amount,
+			COALESCE(g.payment_amount, 0) AS payment_amount,
+			COALESCE(g.jv_debit, 0) AS jv_debit,
+			COALESCE(g.jv_credit, 0) AS jv_credit,
+			COALESCE(g.other_amount, 0) AS other_amount,
+			COALESCE(g.txn_count, 0) AS txn_count
+		FROM `tabAccount` acc
+		LEFT JOIN (
+			SELECT gle.account AS account,
+				SUM(CASE WHEN gle.posting_date < %(from_date)s THEN gle.debit - gle.credit ELSE 0 END) AS opening,
+				SUM(CASE WHEN gle.posting_date BETWEEN %(from_date)s AND %(to_date)s
+							AND gle.voucher_type IN ('Sales Invoice', 'POS Invoice') THEN gle.debit - gle.credit ELSE 0 END) AS invoice_amount,
+				SUM(CASE WHEN gle.posting_date BETWEEN %(from_date)s AND %(to_date)s
+							AND gle.voucher_type = 'Payment Entry' THEN gle.debit - gle.credit ELSE 0 END) AS payment_amount,
+				SUM(CASE WHEN gle.posting_date BETWEEN %(from_date)s AND %(to_date)s
+							AND gle.voucher_type = 'Journal Entry' THEN gle.debit ELSE 0 END) AS jv_debit,
+				SUM(CASE WHEN gle.posting_date BETWEEN %(from_date)s AND %(to_date)s
+							AND gle.voucher_type = 'Journal Entry' THEN gle.credit ELSE 0 END) AS jv_credit,
+				SUM(CASE WHEN gle.posting_date BETWEEN %(from_date)s AND %(to_date)s
+							AND gle.voucher_type NOT IN ('Sales Invoice', 'POS Invoice', 'Payment Entry', 'Journal Entry')
+							THEN gle.debit - gle.credit ELSE 0 END) AS other_amount,
+				COUNT(DISTINCT gle.voucher_no) AS txn_count
+			FROM `tabGL Entry` gle
+			WHERE gle.is_cancelled = 0 {gl_cond}
+			GROUP BY gle.account
+		) g ON g.account = acc.name
+		WHERE acc.company = %(company)s
+			AND acc.account_type IN ('Cash', 'Bank')
+			AND acc.is_group = 0
 		GROUP BY acc.name, acc.account_type
-		HAVING ABS(invoice_amount) > 0.005 OR ABS(payment_amount) > 0.005
-			OR ABS(jv_debit) > 0.005 OR ABS(jv_credit) > 0.005 OR ABS(other_amount) > 0.005
+		ORDER BY acc.account_type, acc.name
 	""", p, as_dict=True)
 
 	for r in rows:
+		r["period_movement"] = (flt(r.invoice_amount) + flt(r.payment_amount)
+			+ flt(r.jv_debit) - flt(r.jv_credit) + flt(r.other_amount))
 		r["closing"] = flt(r.opening) + flt(r.period_movement)
-	return sorted(rows, key=lambda r: (r.account_type, r.account))
+	return rows
 
 
 
@@ -1059,7 +1069,10 @@ def render_html(filters, currency, summary, pos_summary, cash_bank_used,
 	cbu_4_html = cbu_table("Bank", "4. Bank Accounts - GL Reconciled", cbu_note)
 
 	so_rows_html = ""
+	so_totals = {"opening": 0.0, "debit": 0.0, "credit": 0.0, "balance": 0.0}
 	for r in supplier_other:
+		for k in so_totals:
+			so_totals[k] += flt(r.get(k))
 		so_rows_html += f"""<tr>
 			<td>{r['name']}</td><td>{r['type']}</td>
 			<td style='text-align:right;'>{money(r['opening'], currency)}</td>
@@ -1069,9 +1082,20 @@ def render_html(filters, currency, summary, pos_summary, cash_bank_used,
 		</tr>"""
 	if not so_rows_html:
 		so_rows_html = "<tr><td colspan='6' style='text-align:center;color:#adb5bd;'>No supplier/other-account activity</td></tr>"
+	else:
+		so_rows_html += f"""<tr style="background:#f8f9fa;font-weight:700;border-top:2px solid #343a40;">
+			<td>Total</td><td></td>
+			<td style='text-align:right;'>{money(so_totals['opening'], currency)}</td>
+			<td style='text-align:right;'>{money(so_totals['debit'], currency)}</td>
+			<td style='text-align:right;'>{money(so_totals['credit'], currency)}</td>
+			<td style='text-align:right;'>{money(so_totals['balance'], currency)}</td>
+		</tr>"""
 
 	cust_rows_html = ""
+	cust_totals = {"opening": 0.0, "invoice": 0.0, "payment": 0.0, "balance": 0.0}
 	for r in customers:
+		for k in cust_totals:
+			cust_totals[k] += flt(r.get(k))
 		cust_rows_html += f"""<tr>
 			<td>{r['customer']}</td>
 			<td style='text-align:right;'>{money(r['opening'], currency)}</td>
@@ -1081,6 +1105,14 @@ def render_html(filters, currency, summary, pos_summary, cash_bank_used,
 		</tr>"""
 	if not cust_rows_html:
 		cust_rows_html = "<tr><td colspan='5' style='text-align:center;color:#adb5bd;'>No customer activity</td></tr>"
+	else:
+		cust_rows_html += f"""<tr style="background:#f8f9fa;font-weight:700;border-top:2px solid #343a40;">
+			<td>Total</td>
+			<td style='text-align:right;'>{money(cust_totals['opening'], currency)}</td>
+			<td style='text-align:right;'>{money(cust_totals['invoice'], currency)}</td>
+			<td style='text-align:right;'>{money(cust_totals['payment'], currency)}</td>
+			<td style='text-align:right;'>{money(cust_totals['balance'], currency)}</td>
+		</tr>"""
 
 	return f"""
 	<style>
@@ -1265,11 +1297,17 @@ def export_excel(filters=None):
 	# 5 Supplier & Other Accounts
 	so_headers = ["Name", "Type", "Opening", "Debit", "Credit", "Balance"]
 	so_data = [[r["name"], r["type"], r["opening"], r["debit"], r["credit"], r["balance"]] for r in supplier_rows]
+	if so_data:
+		so_t = [sum(flt(x[i]) for x in so_data) for i in (2, 3, 4, 5)]
+		so_data.append(["Total", "", so_t[0], so_t[1], so_t[2], so_t[3]])
 	section("5. Supplier & Other Accounts", so_headers, so_data, money_cols=[3, 4, 5, 6])
 
 	# 6 Customer Balance
 	cust_headers = ["Customer", "Opening", "Invoice", "Payment", "Balance"]
 	cust_data = [[r["customer"], r["opening"], r["invoice"], r["payment"], r["balance"]] for r in customer_rows]
+	if cust_data:
+		c_t = [sum(flt(x[i]) for x in cust_data) for i in (1, 2, 3, 4)]
+		cust_data.append(["Total", c_t[0], c_t[1], c_t[2], c_t[3]])
 	section("6. Customer Balance", cust_headers, cust_data, money_cols=[2, 3, 4, 5])
 
 	ws.append([])
