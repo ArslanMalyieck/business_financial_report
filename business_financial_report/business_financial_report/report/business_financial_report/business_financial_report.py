@@ -23,12 +23,18 @@ DEFAULT_CUSTOMERS = [
 	"Integrated Technical Contracting and Construction Company",
 	"Saba Al- Arabia Contracting Co.",
 	"Alpha Square Contracting Company",
+	"ALROUM ALMAAMRI COMPANY FOR GENERAL CONTRACTING",
+	"FAHAD SAUD AL HARBI GENERAL CONTRACTING CO.",
+	"GREAT MOUNTAIN GENERAL CONTRACTING CO.",
+	"مؤسسة جنى الجبيل للمقاولات",
+	"LEGACY CRANES COMPANY",
 ]
 
 DEFAULT_OTHER_ACCOUNTS = [
 	"Salary Pakistan Account - ACM",
 	"MUSCAT ALSAFWA INT. LLC - ACM",
 	"AL-FORSAN CONTRACTING - ACM",
+	"ACM CO. LTD KOREA - ACM",
 ]
 
 
@@ -480,9 +486,23 @@ def get_other_accounts_summary(filters):
 		GROUP BY account
 	""", p, as_dict=True)
 
+	row_map = {}
 	for r in rows:
 		r["balance"] = flt(r.opening) + flt(r.period_debit) - flt(r.period_credit)
-	return rows
+		row_map[r.account] = r
+
+	result = []
+	for account in accounts:
+		if account in row_map:
+			result.append(row_map[account])
+		else:
+			# show the account even when it has zero activity in the period
+			result.append(frappe._dict({
+				"account": account,
+				"opening": 0.0, "period_debit": 0.0,
+				"period_credit": 0.0, "balance": 0.0,
+			}))
+	return result
 
 
 def get_supplier_and_other_accounts(filters):
@@ -909,6 +929,7 @@ def render_html(filters, currency, summary, pos_summary, cash_bank_used,
 	fd = str(filters.get("from_date") or "")[:10]
 	td = str(filters.get("to_date") or "")[:10]
 
+	# [COMMENTED - not needed] report header / legend info removed
 	report_header_html = """
 	<div class="report-header">
 		<div>
@@ -925,6 +946,7 @@ def render_html(filters, currency, summary, pos_summary, cash_bank_used,
 	</div>""".format(company_name=company_name, fd=fd, td=td, currency=currency,
 		generated=frappe.utils.formatdate(frappe.utils.nowdate()))
 
+	# [COMMENTED - not needed]
 	filters_legend = """
 	<div class="basis-note">
 		<b>Filters - kaunse section ko kaise control karte hain:</b><br>
@@ -990,37 +1012,51 @@ def render_html(filters, currency, summary, pos_summary, cash_bank_used,
 	else:
 		pos_rows_html = "<tr><td colspan='9' style='text-align:center;color:#adb5bd;'>No POS activity in this period</td></tr>"
 
-	cbu_rows_html = ""
-	cbu_totals = {"opening": 0.0, "invoice_amount": 0.0, "payment_amount": 0.0,
-		"jv_debit": 0.0, "jv_credit": 0.0, "other_amount": 0.0, "closing": 0.0}
-	for r in cash_bank_used:
-		for k in cbu_totals:
-			cbu_totals[k] += flt(r.get(k))
-		cbu_rows_html += f"""<tr>
-			<td>{r.account}</td><td>{r.account_type}</td>
-			<td style='text-align:right;'>{money(r.opening, currency)}</td>
-			<td style='text-align:right;'>{money(r.invoice_amount, currency)}</td>
-			<td style='text-align:right;'>{money(r.payment_amount, currency)}</td>
-			<td style='text-align:right;'>{money(r.jv_debit, currency)}</td>
-			<td style='text-align:right;'>{money(r.jv_credit, currency)}</td>
-			<td style='text-align:right;'>{money(r.other_amount, currency)}</td>
-			<td style='text-align:right;font-weight:700;'>{money(r.closing, currency)}</td>
-			<td style='text-align:right;'>{r.txn_count}</td>
-		</tr>"""
-	if not cbu_rows_html:
-		cbu_rows_html = "<tr><td colspan='10' style='text-align:center;color:#adb5bd;'>No cash/bank account activity in this period</td></tr>"
-	else:
-		cbu_rows_html += f"""<tr style="background:#f8f9fa;font-weight:700;border-top:2px solid #343a40;">
-			<td colspan="2">Total (accounts above)</td>
-			<td style='text-align:right;'>{money(cbu_totals['opening'], currency)}</td>
-			<td style='text-align:right;'>{money(cbu_totals['invoice_amount'], currency)}</td>
-			<td style='text-align:right;'>{money(cbu_totals['payment_amount'], currency)}</td>
-			<td style='text-align:right;'>{money(cbu_totals['jv_debit'], currency)}</td>
-			<td style='text-align:right;'>{money(cbu_totals['jv_credit'], currency)}</td>
-			<td style='text-align:right;'>{money(cbu_totals['other_amount'], currency)}</td>
-			<td style='text-align:right;'>{money(cbu_totals['closing'], currency)}</td>
-			<td></td>
-		</tr>"""
+	def cbu_table(account_type, title, note):
+		rows = [r for r in cash_bank_used if r.account_type == account_type]
+		totals = {"opening": 0.0, "invoice_amount": 0.0, "payment_amount": 0.0,
+			"jv_debit": 0.0, "jv_credit": 0.0, "other_amount": 0.0, "closing": 0.0}
+		body = ""
+		for r in rows:
+			for k in totals:
+				totals[k] += flt(r.get(k))
+			body += f"""<tr>
+				<td>{r.account}</td>
+				<td style='text-align:right;'>{money(r.opening, currency)}</td>
+				<td style='text-align:right;'>{money(r.invoice_amount, currency)}</td>
+				<td style='text-align:right;'>{money(r.payment_amount, currency)}</td>
+				<td style='text-align:right;'>{money(r.jv_debit, currency)}</td>
+				<td style='text-align:right;'>{money(r.jv_credit, currency)}</td>
+				<td style='text-align:right;'>{money(r.other_amount, currency)}</td>
+				<td style='text-align:right;font-weight:700;'>{money(r.closing, currency)}</td>
+				<td style='text-align:right;'>{r.txn_count}</td>
+			</tr>"""
+		if not body:
+			body = "<tr><td colspan='9' style='text-align:center;color:#adb5bd;'>No activity in this period</td></tr>"
+		else:
+			body += f"""<tr style="background:#f8f9fa;font-weight:700;border-top:2px solid #343a40;">
+				<td>Total</td>
+				<td style='text-align:right;'>{money(totals['opening'], currency)}</td>
+				<td style='text-align:right;'>{money(totals['invoice_amount'], currency)}</td>
+				<td style='text-align:right;'>{money(totals['payment_amount'], currency)}</td>
+				<td style='text-align:right;'>{money(totals['jv_debit'], currency)}</td>
+				<td style='text-align:right;'>{money(totals['jv_credit'], currency)}</td>
+				<td style='text-align:right;'>{money(totals['other_amount'], currency)}</td>
+				<td style='text-align:right;'>{money(totals['closing'], currency)}</td>
+				<td></td>
+			</tr>"""
+		return f"""<h4 class="section-title">🏦 {title}</h4>
+			<div class="basis-note">{note}</div>
+			<div style="overflow-x:auto;">
+				<table class="bfr-table">
+					<thead><tr><th>Account</th><th>Opening</th><th>Invoice Amount</th><th>Payment Amount</th><th>JV Debit</th><th>JV Credit</th><th>Other</th><th>Closing</th><th>Txns</th></tr></thead>
+					<tbody>{body}</tbody>
+				</table>
+			</div>"""
+
+	cbu_note = "Opening = GL balance before From Date • Invoice = Sales/POS movement • Payments = Payment Entry movement • JV Dr/Cr = Journal legs in period • Other = remaining voucher types • Closing = GL balance at To Date (matches General Ledger / Trial Balance)."
+	cbu_3_html = cbu_table("Cash", "3. Cash Accounts - GL Reconciled", cbu_note)
+	cbu_4_html = cbu_table("Bank", "4. Bank Accounts - GL Reconciled", cbu_note)
 
 	so_rows_html = ""
 	for r in supplier_other:
@@ -1076,8 +1112,6 @@ def render_html(filters, currency, summary, pos_summary, cash_bank_used,
 	</style>
 
 	<div class="bfr-wrap">
-		{report_header_html}
-		{filters_legend}
 		<h4 class="section-title">📊 1. Executive Summary</h4>
 		<div class="kpi-row">{kpi_html}</div>
 
@@ -1094,16 +1128,9 @@ def render_html(filters, currency, summary, pos_summary, cash_bank_used,
 			</table>
 		</div>
 
-		<h4 class="section-title">🏦 3. Cash &amp; Bank Accounts Used - GL Reconciled</h4>
-		<div class="basis-note">Opening = GL balance before From Date • Invoice = Sales/POS voucher movement • Payments = Payment Entry movement • JV Dr/Cr = Journal legs in period • Other = remaining voucher types • Closing = Opening + Invoice + Payments + JV Dr − JV Cr + Other (= GL balance at To Date). Har row ERPNext General Ledger / Trial Balance se match karta hai.</div>
-		<div style="overflow-x:auto;">
-			<table class="bfr-table">
-				<thead><tr><th>Account</th><th>Type</th><th>Opening</th><th>Invoice Amount</th><th>Payment Amount</th><th>JV Debit</th><th>JV Credit</th><th>Other</th><th>Closing</th><th>Txns</th></tr></thead>
-				<tbody>{cbu_rows_html}</tbody>
-			</table>
-		</div>
+		{cbu_3_html}{cbu_4_html}
 
-		<h4 class="section-title">🏭 4. Supplier &amp; Other Accounts</h4>
+<h4 class="section-title">🏭 5. Supplier &amp; Other Accounts</h4>
 		<div style="overflow-x:auto;">
 			<table class="bfr-table">
 				<thead><tr><th>Name</th><th>Type</th><th>Opening</th><th>Debit</th><th>Credit</th><th>Balance</th></tr></thead>
@@ -1111,7 +1138,7 @@ def render_html(filters, currency, summary, pos_summary, cash_bank_used,
 			</table>
 		</div>
 
-		<h4 class="section-title">👤 5. Customer Balance</h4>
+		<h4 class="section-title">👤 6. Customer Balance</h4>
 		<div style="overflow-x:auto;">
 			<table class="bfr-table">
 				<thead><tr><th>Customer</th><th>Opening</th><th>Invoice</th><th>Payment</th><th>Balance</th></tr></thead>
@@ -1224,23 +1251,26 @@ def export_excel(filters=None):
 			r["returns"], r["net_sales"], r["payments"], r["difference"], r["closing_financial"]])
 	section("2. POS Profile Summary - Sales & Payment History", pos_headers, pos_data, money_cols=[2, 3, 4, 5, 6, 7, 8, 9])
 
-	# 3 Cash & Bank Accounts Used (GL Reconciled)
-	cbu_headers = ["Account", "Type", "Opening", "Invoice Amount", "Payment Amount", "JV Debit", "JV Credit", "Other", "Closing", "Txns"]
-	cbu_data = []
-	for r in cbu_rows:
-		cbu_data.append([r["account"], r["account_type"], r["opening"], r["invoice_amount"], r["payment_amount"],
-			r["jv_debit"], r["jv_credit"], r["other_amount"], r["closing"], r["txn_count"]])
-	section("3. Cash & Bank Accounts Used - GL Reconciled", cbu_headers, cbu_data, money_cols=[3, 4, 5, 6, 7, 8, 9])
+	# 3 + 4 Cash & Bank split (GL Reconciled)
+	cbu_headers = ["Account", "Opening", "Invoice Amount", "Payment Amount", "JV Debit", "JV Credit", "Other", "Closing", "Txns"]
+	for cb_type, cb_title in (("Cash", "3. Cash Accounts - GL Reconciled"), ("Bank", "4. Bank Accounts - GL Reconciled")):
+		cbu_data = []
+		for r in cbu_rows:
+			if r["account_type"] != cb_type:
+				continue
+			cbu_data.append([r["account"], r["opening"], r["invoice_amount"], r["payment_amount"],
+				r["jv_debit"], r["jv_credit"], r["other_amount"], r["closing"], r["txn_count"]])
+		section(cb_title, cbu_headers, cbu_data, money_cols=[2, 3, 4, 5, 6, 7, 8])
 
-	# 4 Supplier & Other Accounts
+	# 5 Supplier & Other Accounts
 	so_headers = ["Name", "Type", "Opening", "Debit", "Credit", "Balance"]
 	so_data = [[r["name"], r["type"], r["opening"], r["debit"], r["credit"], r["balance"]] for r in supplier_rows]
-	section("4. Supplier & Other Accounts", so_headers, so_data, money_cols=[3, 4, 5, 6])
+	section("5. Supplier & Other Accounts", so_headers, so_data, money_cols=[3, 4, 5, 6])
 
-	# 5 Customer Balance
+	# 6 Customer Balance
 	cust_headers = ["Customer", "Opening", "Invoice", "Payment", "Balance"]
 	cust_data = [[r["customer"], r["opening"], r["invoice"], r["payment"], r["balance"]] for r in customer_rows]
-	section("5. Customer Balance", cust_headers, cust_data, money_cols=[2, 3, 4, 5])
+	section("6. Customer Balance", cust_headers, cust_data, money_cols=[2, 3, 4, 5])
 
 	ws.append([])
 	ws.append(["Note: Amounts reconcile with ERPNext General Ledger / Trial Balance for the same company & period."])
