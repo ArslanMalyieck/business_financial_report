@@ -16,6 +16,7 @@ DEFAULT_SUPPLIERS = [
 	"NINGBO ZT BULL HYDRAULIC CO., LTD.",
 	"GUANGZHOU YAOZHONG JINYE CO. ITRITA (MAIN)",
 	"GUANGZHOU RATOP MACHINERY PARTS CO.(MAIN)",
+	"ACM CO. LTD KOREA - ACM",
 ]
 
 DEFAULT_CUSTOMERS = [
@@ -30,13 +31,15 @@ DEFAULT_CUSTOMERS = [
 	"LEGACY CRANES COMPANY",
 	"Derra Jeddah Trading",
 	"AXON Power Company for General Contracting",
+	"ARABIAN IMPACT GENERAL CONTRACTING EST.",
+	"Attad Al Modon Construction Co",
+	"Future Soft Contracting Company",
 ]
 
 DEFAULT_OTHER_ACCOUNTS = [
 	"Salary Pakistan Account - ACM",
 	"MUSCAT ALSAFWA INT. LLC - ACM",
 	"AL-FORSAN CONTRACTING - ACM",
-	"ACM CO. LTD KOREA - ACM",
 ]
 
 
@@ -88,6 +91,40 @@ def get_columns():
 
 def get_company_currency(company):
 	return frappe.get_cached_value("Company", company, "default_currency") if company else None
+
+
+def normalize_text(value):
+	return " ".join((value or "").strip().lower().split())
+
+
+def resolve_party_name(doctype, name):
+	"""Find the real master name for a configured name: exact -> case/spaces
+	insensitive -> unique LIKE match on first two words. Returns the
+	configured name unchanged if nothing matches (row then shows zeros)."""
+	if not name:
+		return name
+	if frappe.db.exists(doctype, name):
+		return name
+
+	norm = normalize_text(name)
+	rows = frappe.db.sql(
+		"SELECT name FROM `tab{}` WHERE LOWER(TRIM(name)) = %s LIMIT 1".format(doctype), norm)
+	if rows:
+		return rows[0][0]
+
+	words = norm.split()
+	if len(words) >= 2:
+		pattern = "%" + " ".join(words[:2]) + "%"
+		rows = frappe.db.sql(
+			"SELECT name FROM `tab{}` WHERE LOWER(name) LIKE %s LIMIT 5".format(doctype), pattern)
+		if len(rows) == 1:
+			return rows[0][0]
+	return name
+
+
+def get_party_currency(doctype, party, company_currency):
+	ccy = frappe.db.get_value(doctype, party, "default_currency") if frappe.db.exists(doctype, party) else None
+	return ccy or company_currency or "SAR"
 
 
 def base_params(filters):
@@ -481,6 +518,7 @@ def parse_name_list(text):
 
 
 def get_other_accounts_summary(filters):
+	company_ccy = get_company_currency(filters.get("company"))
 	accounts = [a for a in DEFAULT_OTHER_ACCOUNTS if frappe.db.exists("Account", a)]
 	if not accounts:
 		return []
@@ -490,9 +528,10 @@ def get_other_accounts_summary(filters):
 
 	rows = frappe.db.sql(f"""
 		SELECT account,
-			SUM(CASE WHEN posting_date < %(from_date)s THEN debit - credit ELSE 0 END) AS opening,
-			SUM(CASE WHEN posting_date BETWEEN %(from_date)s AND %(to_date)s THEN debit ELSE 0 END) AS period_debit,
-			SUM(CASE WHEN posting_date BETWEEN %(from_date)s AND %(to_date)s THEN credit ELSE 0 END) AS period_credit
+			SUM(CASE WHEN posting_date < %(from_date)s THEN debit_in_account_currency - credit_in_account_currency ELSE 0 END) AS opening,
+			SUM(CASE WHEN posting_date BETWEEN %(from_date)s AND %(to_date)s THEN debit_in_account_currency ELSE 0 END) AS period_debit,
+			SUM(CASE WHEN posting_date BETWEEN %(from_date)s AND %(to_date)s THEN credit_in_account_currency ELSE 0 END) AS period_credit,
+			SUM(CASE WHEN posting_date <= %(to_date)s THEN debit - credit ELSE 0 END) AS base_balance
 		FROM `tabGL Entry` gle
 		WHERE is_cancelled = 0 AND account IN %(accounts)s {gl_cond}
 		GROUP BY account
@@ -501,6 +540,7 @@ def get_other_accounts_summary(filters):
 	row_map = {}
 	for r in rows:
 		r["balance"] = flt(r.opening) + flt(r.period_debit) - flt(r.period_credit)
+		r["currency"] = frappe.db.get_value("Account", r.account, "account_currency") or company_ccy
 		row_map[r.account] = r
 
 	result = []
@@ -508,20 +548,21 @@ def get_other_accounts_summary(filters):
 		if account in row_map:
 			result.append(row_map[account])
 		else:
-			# show the account even when it has zero activity in the period
 			result.append(frappe._dict({
-				"account": account,
+				"account": account, "currency": company_ccy,
 				"opening": 0.0, "period_debit": 0.0,
-				"period_credit": 0.0, "balance": 0.0,
+				"period_credit": 0.0, "balance": 0.0, "base_balance": 0.0,
 			}))
 	return result
 
 
+
 def get_supplier_and_other_accounts(filters):
+	company_ccy = get_company_currency(filters.get("company"))
 	p = base_params(filters)
 	include_journal = int(filters.get("include_journal_adjustments", 1))
 
-	supplier_list = list(DEFAULT_SUPPLIERS)
+	supplier_list = [resolve_party_name("Supplier", x) for x in DEFAULT_SUPPLIERS]
 
 	gl_cond = get_conditions(filters, "gle")
 	gl_supplier_filter = ""
@@ -530,27 +571,34 @@ def get_supplier_and_other_accounts(filters):
 		gl_supplier_filter = " AND party IN %(supplier_list)s"
 
 	opening_map = {r.party: flt(r.amount) for r in frappe.db.sql(f"""
-		SELECT party, SUM(debit - credit) AS amount FROM `tabGL Entry` gle
+		SELECT party, SUM(debit_in_account_currency - credit_in_account_currency) AS amount FROM `tabGL Entry` gle
 		WHERE is_cancelled = 0 AND party_type = 'Supplier' AND posting_date < %(from_date)s
 			{gl_cond}{gl_supplier_filter}
 		GROUP BY party
 	""", p, as_dict=True)}
 
 	debit_map = {r.party: flt(r.amount) for r in frappe.db.sql(f"""
-		SELECT party, SUM(debit) AS amount FROM `tabGL Entry` gle
+		SELECT party, SUM(debit_in_account_currency) AS amount FROM `tabGL Entry` gle
 		WHERE is_cancelled = 0 AND party_type = 'Supplier'
 			AND posting_date BETWEEN %(from_date)s AND %(to_date)s {gl_cond}{gl_supplier_filter}
 		GROUP BY party
 	""", p, as_dict=True)}
 
 	credit_map = {r.party: flt(r.amount) for r in frappe.db.sql(f"""
-		SELECT party, SUM(credit) AS amount FROM `tabGL Entry` gle
+		SELECT party, SUM(credit_in_account_currency) AS amount FROM `tabGL Entry` gle
 		WHERE is_cancelled = 0 AND party_type = 'Supplier'
 			AND posting_date BETWEEN %(from_date)s AND %(to_date)s {gl_cond}{gl_supplier_filter}
 		GROUP BY party
 	""", p, as_dict=True)}
 
 	closing_map = {r.party: flt(r.amount) for r in frappe.db.sql(f"""
+		SELECT party, SUM(debit_in_account_currency - credit_in_account_currency) AS amount FROM `tabGL Entry` gle
+		WHERE is_cancelled = 0 AND party_type = 'Supplier' AND posting_date <= %(to_date)s
+			{gl_cond}{gl_supplier_filter}
+		GROUP BY party
+	""", p, as_dict=True)}
+
+	base_balance_map = {r.party: flt(r.amount) for r in frappe.db.sql(f"""
 		SELECT party, SUM(debit - credit) AS amount FROM `tabGL Entry` gle
 		WHERE is_cancelled = 0 AND party_type = 'Supplier' AND posting_date <= %(to_date)s
 			{gl_cond}{gl_supplier_filter}
@@ -559,7 +607,7 @@ def get_supplier_and_other_accounts(filters):
 
 	if not include_journal:
 		je_rows = frappe.db.sql(f"""
-			SELECT party, SUM(debit) AS d, SUM(credit) AS c FROM `tabGL Entry` gle
+			SELECT party, SUM(debit_in_account_currency) AS d, SUM(credit_in_account_currency) AS c FROM `tabGL Entry` gle
 			WHERE is_cancelled = 0 AND party_type = 'Supplier' AND voucher_type = 'Journal Entry'
 				AND posting_date BETWEEN %(from_date)s AND %(to_date)s {gl_cond}{gl_supplier_filter}
 			GROUP BY party
@@ -568,38 +616,35 @@ def get_supplier_and_other_accounts(filters):
 			debit_map[r.party] = debit_map.get(r.party, 0.0) - flt(r.d)
 			credit_map[r.party] = credit_map.get(r.party, 0.0) - flt(r.c)
 
-	parties = set(supplier_list) if supplier_list else (
-		set(opening_map) | set(debit_map) | set(credit_map) | set(closing_map)
-	)
-
 	rows = []
-	for party in parties:
-		rows.append({
+	for party in supplier_list:
+		rows.append(frappe._dict({
 			"name": party, "type": "Supplier",
+			"currency": get_party_currency("Supplier", party, company_ccy),
 			"opening": opening_map.get(party, 0.0),
 			"debit": debit_map.get(party, 0.0),
 			"credit": credit_map.get(party, 0.0),
 			"balance": closing_map.get(party, opening_map.get(party, 0.0)),
-		})
+			"base_balance": base_balance_map.get(party, 0.0),
+		}))
 
 	for r in get_other_accounts_summary(filters):
-		rows.append({
-			"name": r.account, "type": "Account",
+		rows.append(frappe._dict({
+			"name": r.account, "type": "Account", "currency": r.get("currency") or company_ccy,
 			"opening": flt(r.opening), "debit": flt(r.period_debit),
 			"credit": flt(r.period_credit), "balance": flt(r.balance),
-		})
+			"base_balance": flt(r.get("base_balance")),
+		}))
 
-	return sorted(rows, key=lambda r: (r["type"], r["name"]))
+	return rows
 
 
-# =======================================================================
-# SECTION 6 - Customer Balance (whitelisted only)
-# =======================================================================
 
 def get_customer_summary(filters):
+	company_ccy = get_company_currency(filters.get("company"))
 	p = base_params(filters)
 
-	customer_list = list(DEFAULT_CUSTOMERS)
+	customer_list = [resolve_party_name("Customer", x) for x in DEFAULT_CUSTOMERS]
 
 	gl_cond = get_conditions(filters, "gle")
 	gl_customer_filter = ""
@@ -608,13 +653,20 @@ def get_customer_summary(filters):
 		gl_customer_filter = " AND party IN %(customer_list)s"
 
 	opening_map = {r.party: flt(r.amount) for r in frappe.db.sql(f"""
-		SELECT party, SUM(debit - credit) AS amount FROM `tabGL Entry` gle
+		SELECT party, SUM(debit_in_account_currency - credit_in_account_currency) AS amount FROM `tabGL Entry` gle
 		WHERE is_cancelled = 0 AND party_type = 'Customer' AND posting_date < %(from_date)s
 			{gl_cond}{gl_customer_filter}
 		GROUP BY party
 	""", p, as_dict=True)}
 
 	closing_map = {r.party: flt(r.amount) for r in frappe.db.sql(f"""
+		SELECT party, SUM(debit_in_account_currency - credit_in_account_currency) AS amount FROM `tabGL Entry` gle
+		WHERE is_cancelled = 0 AND party_type = 'Customer' AND posting_date <= %(to_date)s
+			{gl_cond}{gl_customer_filter}
+		GROUP BY party
+	""", p, as_dict=True)}
+
+	base_balance_map = {r.party: flt(r.amount) for r in frappe.db.sql(f"""
 		SELECT party, SUM(debit - credit) AS amount FROM `tabGL Entry` gle
 		WHERE is_cancelled = 0 AND party_type = 'Customer' AND posting_date <= %(to_date)s
 			{gl_cond}{gl_customer_filter}
@@ -624,7 +676,7 @@ def get_customer_summary(filters):
 	si_cond = get_doc_conditions(filters, "si")
 	si_customer_filter = " AND customer IN %(customer_list)s" if customer_list else ""
 	invoice_map = {r.customer: flt(r.amount) for r in frappe.db.sql(f"""
-		SELECT customer, SUM(base_grand_total) AS amount FROM `tabSales Invoice` si
+		SELECT customer, SUM(grand_total) AS amount FROM `tabSales Invoice` si
 		WHERE docstatus = 1 AND is_return = 0
 			AND posting_date BETWEEN %(from_date)s AND %(to_date)s {si_cond}{si_customer_filter}
 		GROUP BY customer
@@ -633,31 +685,26 @@ def get_customer_summary(filters):
 	pe_cond = get_pe_conditions(filters)
 	pe_customer_filter = " AND party IN %(customer_list)s" if customer_list else ""
 	payment_map = {r.party: flt(r.amount) for r in frappe.db.sql(f"""
-		SELECT party, SUM(base_paid_amount) AS amount FROM `tabPayment Entry` pe
+		SELECT party, SUM(paid_amount) AS amount FROM `tabPayment Entry` pe
 		WHERE docstatus = 1 AND payment_type = 'Receive' AND party_type = 'Customer'
 			AND posting_date BETWEEN %(from_date)s AND %(to_date)s {pe_cond}{pe_customer_filter}
 		GROUP BY party
 	""", p, as_dict=True)}
 
-	customers = set(customer_list) if customer_list else (
-		set(opening_map) | set(closing_map) | set(invoice_map) | set(payment_map)
-	)
-
 	rows = []
-	for c in customers:
-		rows.append({
+	for c in customer_list:
+		rows.append(frappe._dict({
 			"customer": c,
+			"currency": get_party_currency("Customer", c, company_ccy),
 			"opening": opening_map.get(c, 0.0),
 			"invoice": invoice_map.get(c, 0.0),
 			"payment": payment_map.get(c, 0.0),
 			"balance": closing_map.get(c, opening_map.get(c, 0.0)),
-		})
-	return sorted(rows, key=lambda r: r["customer"])
+			"base_balance": base_balance_map.get(c, 0.0),
+		}))
+	return rows
 
 
-# =======================================================================
-# SECTION 7 - Cost Center Performance
-# =======================================================================
 
 def get_cost_center_summary(filters):
 	p = base_params(filters)
@@ -1071,27 +1118,295 @@ def render_html(filters, currency, summary, pos_summary, cash_bank_used,
 	cbu_4_html = cbu_table("Bank", "4. Bank Accounts - GL Reconciled", cbu_note)
 
 	so_rows_html = ""
-	so_totals = {"opening": 0.0, "debit": 0.0, "credit": 0.0, "balance": 0.0}
-	for r in supplier_other:
-		for k in so_totals:
-			so_totals[k] += flt(r.get(k))
-		so_rows_html += f"""<tr>
-			<td>{r['name']}</td><td>{r['type']}</td>
-			<td style='text-align:right;'>{money(r['opening'], currency)}</td>
-			<td style='text-align:right;'>{money(r['debit'], currency)}</td>
-			<td style='text-align:right;'>{money(r['credit'], currency)}</td>
-			<td style='text-align:right;font-weight:700;'>{money(r['balance'], currency)}</td>
+	so_rows = sorted(supplier_other, key=lambda r: ((r.get("currency") or ""), r["name"]))
+	so_grand_base = 0.0
+	if so_rows:
+		cur_ccy = None
+		group = {"opening": 0.0, "debit": 0.0, "credit": 0.0, "balance": 0.0}
+
+		def _flush_so_group(ccy, g):
+			return f"""<tr style="background:#eef6ff;font-weight:700;">
+				<td colspan="3">Subtotal - {ccy}</td>
+				<td style='text-align:right;'>{money(g['opening'], ccy)}</td>
+				<td style='text-align:right;'>{money(g['debit'], ccy)}</td>
+				<td style='text-align:right;'>{money(g['credit'], ccy)}</td>
+				<td style='text-align:right;'>{money(g['balance'], ccy)}</td>
+			</tr>"""
+
+		for r in so_rows:
+			ccy = r.get("currency") or currency
+			if cur_ccy is not None and ccy != cur_ccy:
+				so_rows_html += _flush_so_group(cur_ccy, group)
+				group = {"opening": 0.0, "debit": 0.0, "credit": 0.0, "balance": 0.0}
+			cur_ccy = ccy
+			group["opening"] += flt(r.get("opening"))
+			group["debit"] += flt(r.get("debit"))
+			group["credit"] += flt(r.get("credit"))
+			group["balance"] += flt(r.get("balance"))
+			so_grand_base += flt(r.get("base_balance"))
+			so_rows_html += f"""<tr>
+				<td>{r['name']}</td><td>{r['type']}</td><td>{ccy}</td>
+				<td style='text-align:right;'>{money(r['opening'], ccy)}</td>
+				<td style='text-align:right;'>{money(r['debit'], ccy)}</td>
+				<td style='text-align:right;'>{money(r['credit'], ccy)}</td>
+				<td style='text-align:right;font-weight:700;'>{money(r['balance'], ccy)}</td>
+			</tr>"""
+		so_rows_html += _flush_so_group(cur_ccy, group)
+		so_rows_html += f"""<tr style="background:#f8f9fa;font-weight:800;border-top:2px solid #343a40;">
+			<td colspan="3">Grand Total (base {currency})</td>
+			<td colspan="3"></td>
+			<td style='text-align:right;'>{money(so_grand_base, currency)}</td>
 		</tr>"""
-	if not so_rows_html:
-		so_rows_html = "<tr><td colspan='6' style='text-align:center;color:#adb5bd;'>No supplier/other-account activity</td></tr>"
 	else:
-		so_rows_html += f"""<tr style="background:#f8f9fa;font-weight:700;border-top:2px solid #343a40;">
-			<td>Total</td><td></td>
-			<td style='text-align:right;'>{money(so_totals['opening'], currency)}</td>
-			<td style='text-align:right;'>{money(so_totals['debit'], currency)}</td>
-			<td style='text-align:right;'>{money(so_totals['credit'], currency)}</td>
-			<td style='text-align:right;'>{money(so_totals['balance'], currency)}</td>
+		so_rows_html = "<tr><td colspan='7' style='text-align:center;color:#adb5bd;'>No supplier/other-account activity</td></tr>"
+
+	cust_rows_html = ""
+	cust_rows = sorted(customers, key=lambda r: ((r.get("currency") or ""), r["customer"]))
+	cust_grand_base = 0.0
+	if cust_rows:
+		cur_ccy = None
+		group = {"opening": 0.0, "invoice": 0.0, "payment": 0.0, "balance": 0.0}
+
+		def _flush_cu_group(ccy, g):
+			return f"""<tr style="background:#eef6ff;font-weight:700;">
+				<td colspan="2">Subtotal - {ccy}</td>
+				<td style='text-align:right;'>{money(g['opening'], ccy)}</td>
+				<td style='text-align:right;'>{money(g['invoice'], ccy)}</td>
+				<td style='text-align:right;'>{money(g['payment'], ccy)}</td>
+				<td style='text-align:right;'>{money(g['balance'], ccy)}</td>
+			</tr>"""
+
+		for r in cust_rows:
+			ccy = r.get("currency") or currency
+			if cur_ccy is not None and ccy != cur_ccy:
+				cust_rows_html += _flush_cu_group(cur_ccy, group)
+				group = {"opening": 0.0, "invoice": 0.0, "payment": 0.0, "balance": 0.0}
+			cur_ccy = ccy
+			group["opening"] += flt(r.get("opening"))
+			group["invoice"] += flt(r.get("invoice"))
+			group["payment"] += flt(r.get("payment"))
+			group["balance"] += flt(r.get("balance"))
+			cust_grand_base += flt(r.get("base_balance"))
+			cust_rows_html += f"""<tr>
+				<td>{r['customer']}</td><td>{ccy}</td>
+				<td style='text-align:right;'>{money(r['opening'], ccy)}</td>
+				<td style='text-align:right;'>{money(r['invoice'], ccy)}</td>
+				<td style='text-align:right;'>{money(r['payment'], ccy)}</td>
+				<td style='text-align:right;font-weight:700;'>{money(r['balance'], ccy)}</td>
+			</tr>"""
+		cust_rows_html += _flush_cu_group(cur_ccy, group)
+		cust_rows_html += f"""<tr style="background:#f8f9fa;font-weight:800;border-top:2px solid #343a40;">
+			<td colspan="2">Grand Total (base {currency})</td>
+			<td colspan="3"></td>
+			<td style='text-align:right;'>{money(cust_grand_base, currency)}</td>
 		</tr>"""
+	else:
+		cust_rows_html = "<tr><td colspan='6' style='text-align:center;color:#adb5bd;'>No customer activity</td></tr>"
+
+	return f"""<div class="kpi-card" style="border-color:{color};"><h5>{label}</h5><h2 style="color:{color};">{money(value, currency)}</h2></div>"""
+
+
+def diff_badge(diff):
+	if abs(flt(diff)) < 0.01:
+		return '<span style="background:#28a745;color:#fff;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600;">✓ Reconciled</span>'
+	return '<span style="background:#dc3545;color:#fff;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600;">⚠ Difference</span>'
+
+
+def render_html(filters, currency, summary, pos_summary, cash_bank_used,
+	supplier_other, customers):
+
+	kpi_html = "".join([
+		kpi_card("Total Sales", summary["total_sales"], currency, "#343a40"),
+		kpi_card("POS Sales", summary["pos_sales"], currency, "#007bff"),
+		kpi_card("Normal Sales", summary["normal_sales"], currency, "#17a2b8"),
+		kpi_card("Credit Notes / Returns", summary["credit_notes"], currency, "#dc3545"),
+		kpi_card("Net Sales", summary["net_sales"], currency, "#28a745"),
+		kpi_card("Total Collections", summary["total_collections"], currency, "#20c997"),
+		kpi_card("Total Purchases", summary["total_purchases"], currency, "#fd7e14"),
+		kpi_card("Customer Receivable", summary["customer_receivable"], currency, "#6f42c1"),
+		kpi_card("Supplier Payable", summary["supplier_payable"], currency, "#e83e8c"),
+		kpi_card("Cash Balance", summary["cash_balance"], currency, "#20c997"),
+		kpi_card("Bank Balance", summary["bank_balance"], currency, "#0d6efd"),
+		kpi_card("Cash + Bank Balance", summary["cash_plus_bank"], currency, "#198754"),
+	])
+
+	gl_badge = ''
+
+	company_name = filters.get("company") or "-"
+	fd = str(filters.get("from_date") or "")[:10]
+	td = str(filters.get("to_date") or "")[:10]
+
+	# [COMMENTED - not needed] report header / legend info removed
+	report_header_html = """
+	<div class="report-header">
+		<div>
+			<h2>Business Financial Report</h2>
+			<div class="meta">Company: <b>{company_name}</b> &nbsp;|&nbsp; Period: <b>{fd}</b> to <b>{td}</b> &nbsp;|&nbsp; Currency: <b>{currency}</b></div>
+			<div class="meta">Generated: {generated}</div>
+		</div>
+		<div class="meta" style="margin-left:auto;text-align:right;">
+			<b>Basis (all figures from ERPNext GL Entry unless noted)</b><br>
+			Opening = balance strictly before From Date &nbsp;•&nbsp; Closing = Opening + Period<br>
+			Sign: positive = Debit, negative = Credit<br>
+			Section 2 uses Sales Invoice / POS Opening Entry vouchers
+		</div>
+	</div>""".format(company_name=company_name, fd=fd, td=td, currency=currency,
+		generated=frappe.utils.formatdate(frappe.utils.nowdate()))
+
+	# [COMMENTED - not needed]
+	filters_legend = """
+	<div class="basis-note">
+		<b>Filters - kaunse section ko kaise control karte hain:</b><br>
+		• <b>From / To Date</b> &amp; <b>Company</b>: har section (mandatory)<br>
+		• <b>POS Profile</b>: Section 2 (POS Profile Summary)<br>
+		• <b>Mode of Payment</b>: Section 2 (Collections)<br>
+		• <b>Customer</b>: Section 1 (Sales / Collections / Receivable) aur Section 5 (Customer Balance fixed list alag hai)<br>
+		• <b>Supplier</b>: Section 1 (Purchases)<br>
+		• <b>Include Credit Notes</b>: Section 1 &amp; 2 (returns)<br>
+		<b>Sections 4 (Supplier &amp; Other Accounts) aur 5 (Customer Balance):</b> fixed lists - har waqt wohi names, filters se change nahi hote.
+	<div class="basis-note">
+		<b>Filters - kaunse section ko kaise control karte hain:</b><br>
+		• <b>From / To Date</b> &amp; <b>Company</b>: har section (mandatory)<br>
+		• <b>POS Profile</b>: Section 1 (POS Sales), 2, 4<br>
+		• <b>Mode of Payment</b>: Section 1 (Collections), 2 (Collections), 4<br>
+		• <b>Customer</b>: Section 1 (Sales/Collections/Receivable), 2, 9 (Journal party)<br>
+		• <b>Supplier</b>: Section 1 (Purchases), 9 (Journal party) &nbsp;• Section 5 hamesha fixed supplier list<br>
+		• <b>Cost Center / Project / Account</b>: GL-based sections 1 (balances), 3, 7, 8, 9, 10<br>
+		• <b>Include Credit Notes</b>: Section 1 &amp; 2 returns column<br>
+		• <b>Include Journal Adjustments</b>: Section 1-8 journal effects, Section 9 list<br>
+		<b>Section 5 &amp; 6:</b> fixed lists (suppliers/customers/accounts) - har waqt wohi names, filters se change nahi hote.
+	</div>"""
+
+
+	pos_rows_html = ""
+	if pos_summary:
+		totals = {k: 0.0 for k in ("pos_opening", "financial_opening", "gross_sales", "returns", "net_sales", "payments", "closing_financial")}
+		for r in pos_summary:
+			for k in totals:
+				totals[k] += flt(r[k])
+
+		pos_rows_html += f"""<tr style="background:#eef6ff;font-weight:700;">
+			<td>Opening (all branches)</td>
+			<td style='text-align:right;'>{money(totals['pos_opening'], currency)}</td>
+			<td style='text-align:right;'>{money(totals['financial_opening'], currency)}</td>
+			<td colspan='6'></td>
+		</tr>"""
+
+		for r in pos_summary:
+			pos_rows_html += f"""<tr>
+				<td>{r['pos_profile']}</td>
+				<td style='text-align:right;'>{money(r['pos_opening'], currency)}</td>
+				<td style='text-align:right;'>{money(r['financial_opening'], currency)}</td>
+				<td style='text-align:right;'>{money(r['gross_sales'], currency)}</td>
+				<td style='text-align:right;'>{money(r['returns'], currency)}</td>
+				<td style='text-align:right;'>{money(r['net_sales'], currency)}</td>
+				<td style='text-align:right;'>{money(r['payments'], currency)}</td>
+				<td style='text-align:right;'>{money(r['difference'], currency)} {diff_badge(r['difference'])}</td>
+				<td style='text-align:right;'>{money(r['closing_financial'], currency)}</td>
+			</tr>"""
+
+		pos_rows_html += f"""<tr style="background:#f8f9fa;font-weight:700;border-top:2px solid #343a40;">
+			<td>Total</td>
+			<td style='text-align:right;'>{money(totals['pos_opening'], currency)}</td>
+			<td style='text-align:right;'>{money(totals['financial_opening'], currency)}</td>
+			<td style='text-align:right;'>{money(totals['gross_sales'], currency)}</td>
+			<td style='text-align:right;'>{money(totals['returns'], currency)}</td>
+			<td style='text-align:right;'>{money(totals['net_sales'], currency)}</td>
+			<td style='text-align:right;'>{money(totals['payments'], currency)}</td>
+			<td style='text-align:right;'>{money(totals['net_sales'] - totals['payments'], currency)}</td>
+			<td style='text-align:right;'>{money(totals['closing_financial'], currency)}</td>
+		</tr>"""
+	else:
+		pos_rows_html = "<tr><td colspan='9' style='text-align:center;color:#adb5bd;'>No POS activity in this period</td></tr>"
+
+	def cbu_table(account_type, title, note):
+		rows = [r for r in cash_bank_used if r.account_type == account_type]
+		totals = {"opening": 0.0, "invoice_amount": 0.0, "payment_amount": 0.0,
+			"jv_debit": 0.0, "jv_credit": 0.0, "other_amount": 0.0, "closing": 0.0}
+		body = ""
+		for r in rows:
+			for k in totals:
+				totals[k] += flt(r.get(k))
+			body += f"""<tr>
+				<td>{r.account}</td>
+				<td style='text-align:right;'>{money(r.opening, currency)}</td>
+				<td style='text-align:right;'>{money(r.invoice_amount, currency)}</td>
+				<td style='text-align:right;'>{money(r.payment_amount, currency)}</td>
+				<td style='text-align:right;'>{money(r.jv_debit, currency)}</td>
+				<td style='text-align:right;'>{money(r.jv_credit, currency)}</td>
+				<td style='text-align:right;'>{money(r.other_amount, currency)}</td>
+				<td style='text-align:right;font-weight:700;'>{money(r.closing, currency)}</td>
+				<td style='text-align:right;'>{r.txn_count}</td>
+			</tr>"""
+		if not body:
+			body = "<tr><td colspan='9' style='text-align:center;color:#adb5bd;'>No activity in this period</td></tr>"
+		else:
+			body += f"""<tr style="background:#f8f9fa;font-weight:700;border-top:2px solid #343a40;">
+				<td>Total</td>
+				<td style='text-align:right;'>{money(totals['opening'], currency)}</td>
+				<td style='text-align:right;'>{money(totals['invoice_amount'], currency)}</td>
+				<td style='text-align:right;'>{money(totals['payment_amount'], currency)}</td>
+				<td style='text-align:right;'>{money(totals['jv_debit'], currency)}</td>
+				<td style='text-align:right;'>{money(totals['jv_credit'], currency)}</td>
+				<td style='text-align:right;'>{money(totals['other_amount'], currency)}</td>
+				<td style='text-align:right;'>{money(totals['closing'], currency)}</td>
+				<td></td>
+			</tr>"""
+		return f"""<h4 class="section-title">🏦 {title}</h4>
+			<div class="basis-note">{note}</div>
+			<div style="overflow-x:auto;">
+				<table class="bfr-table">
+					<thead><tr><th>Account</th><th>Opening</th><th>Invoice Amount</th><th>Payment Amount</th><th>JV Debit</th><th>JV Credit</th><th>Other</th><th>Closing</th><th>Txns</th></tr></thead>
+					<tbody>{body}</tbody>
+				</table>
+			</div>"""
+
+	cbu_note = "Opening = GL balance before From Date • Invoice = Sales/POS movement • Payments = Payment Entry movement • JV Dr/Cr = Journal legs in period • Other = remaining voucher types • Closing = GL balance at To Date (matches General Ledger / Trial Balance)."
+	cbu_3_html = cbu_table("Cash", "3. Cash Accounts - GL Reconciled", cbu_note)
+	cbu_4_html = cbu_table("Bank", "4. Bank Accounts - GL Reconciled", cbu_note)
+
+	so_rows_html = ""
+	so_rows = sorted(supplier_other, key=lambda r: ((r.get("currency") or ""), r["name"]))
+	so_grand_base = 0.0
+	if so_rows:
+		cur_ccy = None
+		group = {"opening": 0.0, "debit": 0.0, "credit": 0.0, "balance": 0.0}
+
+		def _flush_so_group(ccy, g):
+			return f"""<tr style="background:#eef6ff;font-weight:700;">
+				<td colspan="3">Subtotal - {ccy}</td>
+				<td style='text-align:right;'>{money(g['opening'], ccy)}</td>
+				<td style='text-align:right;'>{money(g['debit'], ccy)}</td>
+				<td style='text-align:right;'>{money(g['credit'], ccy)}</td>
+				<td style='text-align:right;'>{money(g['balance'], ccy)}</td>
+			</tr>"""
+
+		for r in so_rows:
+			ccy = r.get("currency") or currency
+			if cur_ccy is not None and ccy != cur_ccy:
+				so_rows_html += _flush_so_group(cur_ccy, group)
+				group = {"opening": 0.0, "debit": 0.0, "credit": 0.0, "balance": 0.0}
+			cur_ccy = ccy
+			group["opening"] += flt(r.get("opening"))
+			group["debit"] += flt(r.get("debit"))
+			group["credit"] += flt(r.get("credit"))
+			group["balance"] += flt(r.get("balance"))
+			so_grand_base += flt(r.get("base_balance"))
+			so_rows_html += f"""<tr>
+				<td>{r['name']}</td><td>{r['type']}</td><td>{ccy}</td>
+				<td style='text-align:right;'>{money(r['opening'], ccy)}</td>
+				<td style='text-align:right;'>{money(r['debit'], ccy)}</td>
+				<td style='text-align:right;'>{money(r['credit'], ccy)}</td>
+				<td style='text-align:right;font-weight:700;'>{money(r['balance'], ccy)}</td>
+			</tr>"""
+		so_rows_html += _flush_so_group(cur_ccy, group)
+		so_rows_html += f"""<tr style="background:#f8f9fa;font-weight:800;border-top:2px solid #343a40;">
+			<td colspan="3">Grand Total (base {currency})</td>
+			<td colspan="3"></td>
+			<td style='text-align:right;'>{money(so_grand_base, currency)}</td>
+		</tr>"""
+	else:
+		so_rows_html = "<tr><td colspan='7' style='text-align:center;color:#adb5bd;'>No supplier/other-account activity</td></tr>"
 
 	cust_rows_html = ""
 	cust_totals = {"opening": 0.0, "invoice": 0.0, "payment": 0.0, "balance": 0.0}
@@ -1168,7 +1483,7 @@ def render_html(filters, currency, summary, pos_summary, cash_bank_used,
 <h4 class="section-title">🏭 5. Supplier &amp; Other Accounts</h4>
 		<div style="overflow-x:auto;">
 			<table class="bfr-table">
-				<thead><tr><th>Name</th><th>Type</th><th>Opening</th><th>Debit</th><th>Credit</th><th>Balance</th></tr></thead>
+				<thead><tr><th>Name</th><th>Type</th><th>Currency</th><th>Opening</th><th>Debit</th><th>Credit</th><th>Balance</th></tr></thead>
 				<tbody>{so_rows_html}</tbody>
 			</table>
 		</div>
@@ -1176,7 +1491,7 @@ def render_html(filters, currency, summary, pos_summary, cash_bank_used,
 		<h4 class="section-title">👤 6. Customer Balance</h4>
 		<div style="overflow-x:auto;">
 			<table class="bfr-table">
-				<thead><tr><th>Customer</th><th>Opening</th><th>Invoice</th><th>Payment</th><th>Balance</th></tr></thead>
+				<thead><tr><th>Customer</th><th>Currency</th><th>Opening</th><th>Invoice</th><th>Payment</th><th>Balance</th></tr></thead>
 				<tbody>{cust_rows_html}</tbody>
 			</table>
 		</div>
@@ -1298,20 +1613,14 @@ def export_excel(filters=None):
 		section(cb_title, cbu_headers, cbu_data, money_cols=[2, 3, 4, 5, 6, 7, 8])
 
 	# 5 Supplier & Other Accounts
-	so_headers = ["Name", "Type", "Opening", "Debit", "Credit", "Balance"]
-	so_data = [[r["name"], r["type"], r["opening"], r["debit"], r["credit"], r["balance"]] for r in supplier_rows]
-	if so_data:
-		so_t = [sum(flt(x[i]) for x in so_data) for i in (2, 3, 4, 5)]
-		so_data.append(["Total", "", so_t[0], so_t[1], so_t[2], so_t[3]])
-	section("5. Supplier & Other Accounts", so_headers, so_data, money_cols=[3, 4, 5, 6])
+	so_headers = ["Name", "Type", "Currency", "Opening", "Debit", "Credit", "Balance"]
+	so_data = [[r["name"], r["type"], r.get("currency") or currency, r["opening"], r["debit"], r["credit"], r["balance"]] for r in supplier_rows]
+	section("5. Supplier & Other Accounts", so_headers, so_data, money_cols=[4, 5, 6, 7])
 
 	# 6 Customer Balance
-	cust_headers = ["Customer", "Opening", "Invoice", "Payment", "Balance"]
-	cust_data = [[r["customer"], r["opening"], r["invoice"], r["payment"], r["balance"]] for r in customer_rows]
-	if cust_data:
-		c_t = [sum(flt(x[i]) for x in cust_data) for i in (1, 2, 3, 4)]
-		cust_data.append(["Total", c_t[0], c_t[1], c_t[2], c_t[3]])
-	section("6. Customer Balance", cust_headers, cust_data, money_cols=[2, 3, 4, 5])
+	cust_headers = ["Customer", "Currency", "Opening", "Invoice", "Payment", "Balance"]
+	cust_data = [[r["customer"], r.get("currency") or currency, r["opening"], r["invoice"], r["payment"], r["balance"]] for r in customer_rows]
+	section("6. Customer Balance", cust_headers, cust_data, money_cols=[3, 4, 5, 6])
 
 	ws.append([])
 	ws.append(["Note: Amounts reconcile with ERPNext General Ledger / Trial Balance for the same company & period."])
