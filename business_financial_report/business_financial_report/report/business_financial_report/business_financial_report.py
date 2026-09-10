@@ -1568,11 +1568,15 @@ def export_excel(filters=None):
 			cell.border = border
 		for r in rows:
 			ws.append(r)
+			is_marker = isinstance(r[0], str) and (r[0].startswith("Subtotal") or r[0].startswith("Grand Total"))
 			for c in range(1, len(headers) + 1):
 				cell = ws.cell(ws.max_row, c)
 				cell.border = border
 				if c in money_cols and isinstance(r[c - 1], (int, float)):
 					cell.number_format = money_fmt
+				if is_marker:
+					cell.font = Font(bold=True)
+					cell.fill = PatternFill("solid", fgColor="EEF6FF" if r[0].startswith("Subtotal") else "F8F9FA")
 		for c in range(1, len(headers) + 1):
 			ws.column_dimensions[get_column_letter(c)].width = 26
 
@@ -1614,12 +1618,46 @@ def export_excel(filters=None):
 
 	# 5 Supplier & Other Accounts
 	so_headers = ["Name", "Type", "Currency", "Opening", "Debit", "Credit", "Balance"]
-	so_data = [[r["name"], r["type"], r.get("currency") or currency, r["opening"], r["debit"], r["credit"], r["balance"]] for r in supplier_rows]
+	so_sorted = sorted(supplier_rows, key=lambda r: ((r.get("currency") or currency), r["name"]))
+	so_data = []
+	if so_sorted:
+		cur_ccy = None
+		g = [0.0, 0.0, 0.0, 0.0]
+		base_grand = 0.0
+		for r in so_sorted:
+			ccy = r.get("currency") or currency
+			if cur_ccy is not None and ccy != cur_ccy:
+				so_data.append(["Subtotal - " + cur_ccy, "", cur_ccy, g[0], g[1], g[2], g[3]])
+				g = [0.0, 0.0, 0.0, 0.0]
+			cur_ccy = ccy
+			for i, k in enumerate(("opening", "debit", "credit", "balance")):
+				g[i] += flt(r.get(k))
+			base_grand += flt(r.get("base_balance"))
+			so_data.append([r["name"], r["type"], ccy, r["opening"], r["debit"], r["credit"], r["balance"]])
+		so_data.append(["Subtotal - " + cur_ccy, "", cur_ccy, g[0], g[1], g[2], g[3]])
+		so_data.append(["Grand Total (base " + (currency or "") + ")", "", "", None, None, None, base_grand])
 	section("5. Supplier & Other Accounts", so_headers, so_data, money_cols=[4, 5, 6, 7])
 
 	# 6 Customer Balance
 	cust_headers = ["Customer", "Currency", "Opening", "Invoice", "Payment", "Balance"]
-	cust_data = [[r["customer"], r.get("currency") or currency, r["opening"], r["invoice"], r["payment"], r["balance"]] for r in customer_rows]
+	cust_sorted = sorted(customer_rows, key=lambda r: ((r.get("currency") or currency), r["customer"]))
+	cust_data = []
+	if cust_sorted:
+		cur_ccy = None
+		g = [0.0, 0.0, 0.0, 0.0]
+		base_grand = 0.0
+		for r in cust_sorted:
+			ccy = r.get("currency") or currency
+			if cur_ccy is not None and ccy != cur_ccy:
+				cust_data.append(["Subtotal - " + cur_ccy, ccy, g[0], g[1], g[2], g[3]])
+				g = [0.0, 0.0, 0.0, 0.0]
+			cur_ccy = ccy
+			for i, k in enumerate(("opening", "invoice", "payment", "balance")):
+				g[i] += flt(r.get(k))
+			base_grand += flt(r.get("base_balance"))
+			cust_data.append([r["customer"], ccy, r["opening"], r["invoice"], r["payment"], r["balance"]])
+		cust_data.append(["Subtotal - " + cur_ccy, cur_ccy, g[0], g[1], g[2], g[3]])
+		cust_data.append(["Grand Total (base " + (currency or "") + ")", "", None, None, None, base_grand])
 	section("6. Customer Balance", cust_headers, cust_data, money_cols=[3, 4, 5, 6])
 
 	ws.append([])
